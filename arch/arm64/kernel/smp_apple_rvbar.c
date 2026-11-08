@@ -24,10 +24,14 @@
  * 1 << core to +0x8 + 4 * cluster (fffffe0009b94bd0..c84); power off writes
  * the packed bit to +0x0 (fffffe0009b94c8c..ecc).
  *
- * AppleARMCPU::quiesceCPU (fffffe0008c6eafc) disables the core in PMGR and
- * tail-calls ml_arm_sleep (fffffe000be07d68), which calls
- * arm64_prepare_for_sleep(1) (fffffe000be07e94..e98). It unlocks the core's
- * CoreSight debug block (LAR +0xfb0, EDPRCR +0x310) first only when
+ * A secondary going down for system sleep runs PE_cpu_machine_quiesce
+ * (fffffe000c56df5c): ApplePMGR::disableCPUCore (fffffe0009b953ac, the stop
+ * bit above), then ml_arm_sleep (fffffe000be07d68). ml_arm_sleep's sleep
+ * token, hold and arm64_prepare_for_sleep(1) belong to the system sleep and
+ * are the S2R driver's (apple_rvbar_set_sleep_die); this file provides the
+ * stop, the park's restart and the EL2 sleep request
+ * (apple_rvbar_system_sleep). ml_arm_sleep unlocks the core's CoreSight
+ * debug block (LAR +0xfb0, EDPRCR +0x310) only when
  * cpu_data->coresight_base[ED] is mapped (fffffe000be07e78..e90), which XNU
  * does only when /chosen effective-production-status-ap is 0
  * (fffffe000be07fc4..803c). J713 reads 1: no CoreSight write. Writing it
@@ -54,6 +58,7 @@
 #include <asm/smp_plat.h>
 #include <asm/suspend.h>
 #include <asm/sysreg.h>
+#include <asm/virt.h>
 
 #define RVBAR_MAILBOX_MAGIC	0x4b414c3252564241ULL
 #define RVBAR_MAILBOX_SLOTS	24
@@ -96,7 +101,7 @@ static void __iomem *rvbar_cpu_start;
 u32 apple_ctxr_active __ro_after_init;
 static phys_addr_t rvbar_vectors_pa, ctxr_entry;
 extern char apple_ctxr_trampoline[], apple_ctxr_trampoline_end[];
-extern char apple_ctxr_mailbox[];
+extern char apple_ctxr_mailbox[], apple_ctxr_el2_vectors[];
 /* Bit stride of a cluster in the packed start/stop mask: its largest core count. */
 static u32 rvbar_cluster_stride;
 
@@ -168,6 +173,8 @@ static int apple_ctxr_install_entry(void)
 	flush_icache_range((unsigned long)vectors, (unsigned long)vectors + SZ_16K);
 	memunmap(vectors);
 	ctxr_entry = rvbar_vectors_pa + SZ_4K;
+	/* The boot CPU's hyp stub hands its VBAR_EL2 to the in-window copy. */
+	__hyp_set_vectors(ctxr_entry + (apple_ctxr_el2_vectors - apple_ctxr_trampoline));
 	pr_info("Apple CTXR: EL1 CPU entry at %pa; VHE/KVM unavailable\n", &ctxr_entry);
 	return 0;
 }
@@ -273,7 +280,7 @@ static int apple_rvbar_cpu_boot(unsigned int cpu)
  * slot filled, it then takes the reset path itself: MMU off through the idmap
  * (cpu_soft_restart, as kexec) and into the slot's entry at the kernel's EL.
  */
-static void apple_rvbar_restart_if_slot(void)
+void apple_rvbar_restart_if_slot(void)
 {
 	struct rvbar_slot __iomem *slot = &rvbar_mailbox->slots[smp_processor_id()];
 	typeof(cpu_soft_restart) *restart;
@@ -286,30 +293,39 @@ static void apple_rvbar_restart_if_slot(void)
 	restart = (void *)__pa_symbol(cpu_soft_restart);
 	restart(0, entry, 0, 0, 0);
 }
+EXPORT_SYMBOL_GPL(apple_rvbar_restart_if_slot);
 
 /*
- * arm64_prepare_for_sleep (fffffe000bc31600): a core power-down sets
- * SIQ_CFG_EL1[1:0] to 3 and clears bit 0 of s3_1_c15_c7_4, each followed by
- * an isb; system sleep sets bits 0 and 63 of s3_5_c15_c6_2 instead; then WFI
- * until the power goes, acknowledging the fast IPI after each spurious wake.
- * Under Linux (EL2, VHE) s3_1_c15_c7_4 reads 0x6 on J713, bit 0 already
- * clear, so the clear writes nothing. The system-sleep write is UNDEFINED at
- * EL2 and at EL1 in raw boot mode, so for system sleep (@sleep) it is left
- * out.
+ * arm64_prepare_for_sleep(1) (fffffe000bc31640..bc31664), the system-sleep
+ * request, which XNU makes at EL2: the HVC enters the CTXR-D vectors
+ * (apple_ctxr_el2_vectors), which write s3_5_c15_c6_2 and WFI until the
+ * power goes. The boot CPU's VBAR_EL2 points there from
+ * apple_ctxr_install_entry, every other start's from the trampoline.
  */
-void __noreturn apple_rvbar_core_off(bool sleep)
+void __noreturn apple_rvbar_system_sleep(void)
 {
-	/*
-	 * System sleep (@sleep): arm64_prepare_for_sleep(1) writes only
-	 * s3_5_c15_c6_2 before the WFI, and that write UNDEFs at EL1 as well as
-	 * at EL2 on J713. The core
-	 * takes the core power-down instead, the one path an aborted suspend can
-	 * wake: cpu_boot's IPI does not wake a core waiting without SIQ_CFG
-	 * (system-sleep down/up of CPU1 hung in add_cpu, J713 2026-10-04), and a
-	 * core parked at EL1 ignored its slot (cycle 30). In a real SoC sleep the
-	 * core loses power either way and comes back through RVBAR and its slot
-	 * (cpu_resume for the boot CPU, apple_rvbar_set_resume_entry).
-	 */
+	asm volatile("hvc #0" ::: "memory");
+	unreachable();
+}
+EXPORT_SYMBOL_GPL(apple_rvbar_system_sleep);
+
+/* ml_arm_sleep on a secondary in system sleep, run by the S2R driver. */
+static void (*apple_rvbar_sleep_die)(unsigned int cpu);
+
+void apple_rvbar_set_sleep_die(void (*die)(unsigned int cpu))
+{
+	apple_rvbar_sleep_die = die;
+}
+EXPORT_SYMBOL_GPL(apple_rvbar_set_sleep_die);
+
+/*
+ * arm64_prepare_for_sleep(0) (fffffe000bc31610..bc3163c), a core power-down:
+ * SIQ_CFG_EL1[1:0] = 3 and bit 0 of s3_1_c15_c7_4 cleared, each followed by
+ * an isb, then WFI until the power goes, acknowledging the fast IPI after
+ * each wake. s3_1_c15_c7_4 reads 0x6 on J713, bit 0 already clear.
+ */
+static void __noreturn apple_rvbar_core_off(void)
+{
 	sysreg_clear_set_s(SYS_APL_SIQ_CFG_EL1, 3, 3);
 	isb();
 	/* Mach-O EL1 cannot access CORE_OFF; the EL2 entry initialized it. */
@@ -330,7 +346,6 @@ void __noreturn apple_rvbar_core_off(bool sleep)
 		apple_rvbar_restart_if_slot();
 	}
 }
-EXPORT_SYMBOL_GPL(apple_rvbar_core_off);
 
 #ifdef CONFIG_HOTPLUG_CPU
 static bool apple_rvbar_cpu_can_disable(unsigned int cpu)
@@ -343,7 +358,7 @@ static int apple_rvbar_cpu_disable(unsigned int cpu)
 	return 0;
 }
 
-/* AppleARMCPU::quiesceCPU -> ApplePMGR disableCPUCore, then ml_arm_sleep. */
+/* PE_cpu_machine_quiesce: ApplePMGR::disableCPUCore, then ml_arm_sleep. */
 static void apple_rvbar_cpu_die(unsigned int cpu)
 {
 	rvbar_cpus[cpu].powered_off = true;
@@ -351,14 +366,9 @@ static void apple_rvbar_cpu_die(unsigned int cpu)
 	writeq(0, &rvbar_mailbox->slots[cpu].mpidr);
 	dsb(sy);
 	writel(apple_rvbar_core_bit(cpu), rvbar_cpu_start + CPU_START_STOP);
-	/*
-	 * ml_arm_sleep (K:be07e4c..be07e98): the secondary goes down at once; the
-	 * hold it checks (K:ca47dfc) is only set on a debugger stop path
-	 * (K:be05634), and the boot CPU waits for the secondaries' sleep tokens
-	 * before its own sleep. In S2R that is the system-sleep variant
-	 * (apple_rvbar_core_off).
-	 */
-	apple_rvbar_core_off(pm_suspend_target_state == PM_SUSPEND_MEM);
+	if (pm_suspend_target_state == PM_SUSPEND_MEM)
+		apple_rvbar_sleep_die(cpu);
+	apple_rvbar_core_off();
 }
 
 static int apple_rvbar_cpu_kill(unsigned int cpu)

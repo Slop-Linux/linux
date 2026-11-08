@@ -27,9 +27,13 @@
 	b	\fail
 .endm
 
-/* Both callers run with the MMU off; no identity mapping is needed here. */
+/*
+ * Both callers run with the MMU off; no identity mapping is needed here.
+ * Aligned to 2 KiB here and copied to a 4 KiB boundary, the copy keeps
+ * apple_ctxr_el2_vectors a valid VBAR_EL2.
+ */
 	.pushsection ".text", "ax"
-	.balign 8
+	.balign 2048
 SYM_CODE_START(apple_ctxr_trampoline)
 	msr	daifset, #0xf
 	msr	oslar_el1, xzr
@@ -56,6 +60,8 @@ SYM_CODE_START(apple_ctxr_trampoline)
 	init_el2_hcr HCR_HOST_NVHE_FLAGS | HCR_ATA
 	init_el2_state
 	bl	apple_ctxr_prepare_el1
+	adr	x0, apple_ctxr_el2_vectors
+	msr	vbar_el2, x0
 	mov_q	x0, INIT_SCTLR_EL1_MMU_OFF
 	msr_s	SYS_SCTLR_EL12, x0
 	msr	elr_el2, x19
@@ -80,6 +86,42 @@ SYM_FUNC_START(apple_ctxr_prepare_el1)
 	isb
 	ret
 SYM_FUNC_END(apple_ctxr_prepare_el1)
+
+/*
+ * EL2 vectors inside CTXR-D. Their one entry, synchronous from EL1, is the
+ * HVC of apple_rvbar_system_sleep: arm64_prepare_for_sleep(1) as XNU runs it
+ * at EL2 (26A428 K:fffffe000bc31640..bc31664): s3_5_c15_c6_2 |= bit 0 |
+ * bit 63 with no isb, then dsb sy; isb; wfi forever, acknowledging the fast
+ * IPI (s3_5_c15_c1_1 = 1) after each wake. The only exit is the power loss
+ * of system sleep and the reset through RVBAR. No register is kept across
+ * WFI, which may clear them.
+ */
+	.balign 2048
+SYM_CODE_START(apple_ctxr_el2_vectors)
+	.rept	8
+	b	.
+	.balign	0x80
+	.endr
+	b	apple_ctxr_el2_system_sleep	// synchronous, lower EL, AArch64
+	.balign	0x80
+	.rept	7
+	b	.
+	.balign	0x80
+	.endr
+SYM_CODE_END(apple_ctxr_el2_vectors)
+
+SYM_CODE_START_LOCAL(apple_ctxr_el2_system_sleep)
+	mrs_s	x1, sys_reg(3, 5, 15, 6, 2)
+	orr	x1, x1, #1
+	orr	x1, x1, #(1 << 63)
+	msr_s	sys_reg(3, 5, 15, 6, 2), x1
+1:	dsb	sy
+	isb
+	wfi
+	mov	x9, #1
+	msr_s	sys_reg(3, 5, 15, 1, 1), x9
+	b	1b
+SYM_CODE_END(apple_ctxr_el2_system_sleep)
 
 	.balign 8
 SYM_DATA_START(apple_ctxr_mailbox)
