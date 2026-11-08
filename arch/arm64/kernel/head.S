@@ -347,6 +347,8 @@ SYM_INNER_LABEL(init_el2, SYM_L_LOCAL)
 	mov	w4, #1
 	str	w4, [x3]
 	dsb	sy
+	/* Discard a stale cache line before the MMU-off store is read at EL1. */
+	dc	ivac, x3
 	bl	apple_ctxr_prepare_el1
 	mov	w0, #BOOT_CPU_MODE_EL1
 	eret

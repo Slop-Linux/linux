@@ -25,7 +25,8 @@
 	b	\fail
 .endm
 
-	.pushsection ".idmap.text", "ax"
+/* Both callers run with the MMU off; no identity mapping is needed here. */
+	.pushsection ".text", "ax"
 	.balign 8
 SYM_CODE_START(apple_ctxr_trampoline)
 	msr	daifset, #0xf
