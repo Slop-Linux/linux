@@ -1,8 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * T8132 / 26A428 Mach-O reset state permits EL2 fetches in the CTXR-D
- * window and EL1 fetches outside it. Copy this position-independent
- * entry into the reserved m1n1 vectors page before releasing CPUs.
+ * T8132 / 26A428 Mach-O secondaries permit EL2 fetches in the CTXR-D
+ * window and EL1 fetches outside it. CTXR-D covers the loaded region from
+ * DeviceTree/TrustCache through the executable segment, not just TEXT_EXEC.
+ * Copy this position-independent entry into the reserved m1n1 vectors page,
+ * which lies within that window, before releasing CPUs.
  */
 #include <linux/linkage.h>
 #include <asm/assembler.h>
