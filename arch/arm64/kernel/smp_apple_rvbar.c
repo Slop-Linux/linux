@@ -164,7 +164,7 @@ static int apple_ctxr_install_entry(void)
 	memcpy(vectors + SZ_4K, apple_ctxr_trampoline, size);
 	memcpy(vectors + SZ_4K + mailbox_offset, &mailbox, sizeof(mailbox));
 	memcpy(vectors, &branch, sizeof(branch));
-	__flush_icache_range((unsigned long)vectors, (unsigned long)vectors + SZ_16K);
+	flush_icache_range((unsigned long)vectors, (unsigned long)vectors + SZ_16K);
 	memunmap(vectors);
 	ctxr_entry = rvbar_vectors_pa + SZ_4K;
 	pr_info("Apple CTXR: EL1 CPU entry at %pa; VHE/KVM unavailable\n", &ctxr_entry);
