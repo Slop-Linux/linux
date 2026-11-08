@@ -67,6 +67,15 @@ SYM_CODE_START(apple_ctxr_trampoline)
 SYM_CODE_END(apple_ctxr_trampoline)
 
 SYM_FUNC_START(apple_ctxr_prepare_el1)
+	/*
+	 * CORE_OFF (arm64_prepare_for_sleep, 26A428) is accessible at EL2,
+	 * but its EL1 read is UNDEFINED on both E and P cores in Mach-O boot.
+	 * Initialize bit 0 before relinquishing EL2. Both core types read 0x6
+	 * here, so this preserves their existing core power-down configuration.
+	 */
+	mrs_s	x0, sys_reg(3, 1, 15, 7, 4)
+	bic	x0, x0, #1
+	msr_s	sys_reg(3, 1, 15, 7, 4), x0
 	finalise_el2_state
 	isb
 	ret

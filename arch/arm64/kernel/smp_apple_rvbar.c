@@ -6,7 +6,8 @@
  * iBoot locks every core's RVBAR to m1n1's vectors. m1n1 keeps its vectors,
  * a reset dispatcher and a mailbox in a page it reserves for us: a core that
  * comes out of reset finds its {MPIDR | valid, entry} slot and jumps to the
- * entry at EL2 with the MMU off. A secondary's first start goes through
+ * entry at EL2 with the MMU off. With CTXR active, Linux replaces that
+ * dispatcher with an in-window entry which drops to EL1. A first start goes through
  * m1n1's spin table (cpu-release-addr), where it is parked from boot; later
  * starts, after the OS powered it off, and the boot CPU's wake from S2R go
  * through the mailbox. Linux sets the mailbox magic when it maps it, so a
@@ -79,7 +80,7 @@ struct rvbar_mailbox {
 
 /* arm64_prepare_for_sleep's system registers. */
 #define SYS_APL_SIQ_CFG_EL1	sys_reg(3, 4, 15, 10, 4)
-#define SYS_APL_CORE_OFF_EL1	sys_reg(3, 1, 15, 7, 4)
+#define SYS_APL_CORE_OFF_EL2	sys_reg(3, 1, 15, 7, 4)
 #define SYS_APL_IPI_SR_EL1	sys_reg(3, 5, 15, 1, 1)
 /* Fast IPI request registers (irq-apple-aic). */
 #define SYS_APL_IPI_RR_LOCAL_EL1	sys_reg(3, 5, 15, 0, 0)
@@ -270,7 +271,7 @@ static int apple_rvbar_cpu_boot(unsigned int cpu)
  * A powered-down core does not always lose power on J713 (impl +0x100 stays
  * active, cpu_kill -ETIMEDOUT, 2026-10-03). Woken by cpu_boot's IPI with its
  * slot filled, it then takes the reset path itself: MMU off through the idmap
- * (cpu_soft_restart, as kexec) and into the slot's entry at EL2.
+ * (cpu_soft_restart, as kexec) and into the slot's entry at the kernel's EL.
  */
 static void apple_rvbar_restart_if_slot(void)
 {
@@ -311,8 +312,11 @@ void __noreturn apple_rvbar_core_off(bool sleep)
 	 */
 	sysreg_clear_set_s(SYS_APL_SIQ_CFG_EL1, 3, 3);
 	isb();
-	sysreg_clear_set_s(SYS_APL_CORE_OFF_EL1, BIT(0), 0);
-	isb();
+	/* Mach-O EL1 cannot access CORE_OFF; the EL2 entry initialized it. */
+	if (!apple_ctxr_active) {
+		sysreg_clear_set_s(SYS_APL_CORE_OFF_EL2, BIT(0), 0);
+		isb();
+	}
 
 	/*
 	 * The core does not lose power here on J713: impl +0x100 reads 0f01d900
