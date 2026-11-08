@@ -98,7 +98,17 @@ SYM_FUNC_END(apple_ctxr_prepare_el1)
  */
 	.balign 2048
 SYM_CODE_START(apple_ctxr_el2_vectors)
-	.rept	8
+	.rept	4
+	b	.
+	.balign	0x80
+	.endr
+	/* S2R debug: synchronous at EL2 prints '!' on the dockchannel console */
+	mov_q	x2, 0x38812c000
+	mov	w3, #'!'
+	str	w3, [x2, #4]
+	b	.
+	.balign	0x80
+	.rept	3
 	b	.
 	.balign	0x80
 	.endr
@@ -111,10 +121,16 @@ SYM_CODE_START(apple_ctxr_el2_vectors)
 SYM_CODE_END(apple_ctxr_el2_vectors)
 
 SYM_CODE_START_LOCAL(apple_ctxr_el2_system_sleep)
+	/* S2R debug: '[' before and ']' after the request on the dockchannel console */
+	mov_q	x2, 0x38812c000
+	mov	w3, #'['
+	str	w3, [x2, #4]
 	mrs_s	x1, sys_reg(3, 5, 15, 6, 2)
 	orr	x1, x1, #1
 	orr	x1, x1, #(1 << 63)
 	msr_s	sys_reg(3, 5, 15, 6, 2), x1
+	mov	w3, #']'
+	str	w3, [x2, #4]
 1:	dsb	sy
 	isb
 	wfi
