@@ -325,6 +325,33 @@ SYM_INNER_LABEL(init_el2, SYM_L_LOCAL)
 	mov	x0, #INIT_PSTATE_EL1
 	msr	spsr_el2, x0
 
+#ifdef CONFIG_ARCH_APPLE
+	/*
+	 * T8132 Mach-O boot restricts secondary EL2 execution to iBoot's
+	 * CTXR window. ACC retains the reset configuration even when the
+	 * boot CPU's local CTXR controls are zero. Keep every CPU at EL1;
+	 * the RVBAR backend supplies the secondary's in-window EL2 entry.
+	 */
+	mrs	x3, midr_el1
+	ubfx	x4, x3, #MIDR_IMPLEMENTOR_SHIFT, #8
+	cmp	x4, #ARM_CPU_IMP_APPLE
+	b.ne	4f
+	ubfx	x3, x3, #MIDR_PARTNUM_SHIFT, #12
+	and	x3, x3, #~1
+	cmp	x3, #APPLE_CPU_PART_M4_DONAN_ECORE
+	b.ne	4f
+	mrs_s	x3, sys_reg(3, 0, 11, 8, 7) // ACC CTXR-D CTL
+	tst	x3, #0x3ff
+	b.eq	4f
+	adr_l	x3, apple_ctxr_active
+	mov	w4, #1
+	str	w4, [x3]
+	dsb	sy
+	bl	apple_ctxr_prepare_el1
+	mov	w0, #BOOT_CPU_MODE_EL1
+	eret
+4:
+#endif
 	mov	w0, #BOOT_CPU_MODE_EL2
 	orr	x0, x0, x2
 	eret

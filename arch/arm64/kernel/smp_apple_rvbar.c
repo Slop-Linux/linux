@@ -39,6 +39,8 @@
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
+#include <linux/sizes.h>
 #include <linux/smp.h>
 #include <linux/suspend.h>
 #include <linux/types.h>
@@ -90,6 +92,10 @@ void apple_rvbar_retention_wfi(void);
 static phys_addr_t rvbar_mailbox_pa, rvbar_cpu_start_pa;
 static struct rvbar_mailbox __iomem *rvbar_mailbox;
 static void __iomem *rvbar_cpu_start;
+u32 apple_ctxr_active __ro_after_init;
+static phys_addr_t rvbar_vectors_pa, ctxr_entry;
+extern char apple_ctxr_trampoline[], apple_ctxr_trampoline_end[];
+extern char apple_ctxr_mailbox[];
 /* Bit stride of a cluster in the packed start/stop mask: its largest core count. */
 static u32 rvbar_cluster_stride;
 
@@ -109,11 +115,18 @@ static int __init apple_rvbar_cpu_init(unsigned int cpu)
 	int ret;
 
 	if (!rvbar_mailbox_pa) {
+		struct resource res;
+
 		mb = of_find_compatible_node(NULL, NULL, "apple,rvbar-mailbox");
 		if (!mb)
 			return -ENODEV;
 		ret = of_property_read_u64(mb, "apple,mailbox", &rvbar_mailbox_pa) ?:
 		      of_property_read_u64(mb, "apple,cpu-start", &rvbar_cpu_start_pa);
+		if (!ret && apple_ctxr_active) {
+			ret = of_address_to_resource(mb, 0, &res);
+			if (!ret)
+				rvbar_vectors_pa = res.start;
+		}
 		of_node_put(mb);
 		if (ret)
 			return ret;
@@ -132,13 +145,46 @@ static int __init apple_rvbar_cpu_init(unsigned int cpu)
 	return ret;
 }
 
+static int apple_ctxr_install_entry(void)
+{
+	size_t size = apple_ctxr_trampoline_end - apple_ctxr_trampoline;
+	size_t mailbox_offset = apple_ctxr_mailbox - apple_ctxr_trampoline;
+	void *vectors = memremap(rvbar_vectors_pa, SZ_16K, MEMREMAP_WB);
+	__le32 branch = cpu_to_le32(0x14000000 | (SZ_4K / 4));
+	__le64 mailbox = cpu_to_le64(rvbar_mailbox_pa);
+
+	if (!vectors)
+		return -ENOMEM;
+
+	/*
+	 * m1n1's mailbox ends below +0x1000; the remaining 12 KiB of its
+	 * reserved vectors page is inside CTXR-D. The same entry handles
+	 * initial spin-table release and RVBAR after power-off or S2R.
+	 */
+	memcpy(vectors + SZ_4K, apple_ctxr_trampoline, size);
+	memcpy(vectors + SZ_4K + mailbox_offset, &mailbox, sizeof(mailbox));
+	memcpy(vectors, &branch, sizeof(branch));
+	__flush_icache_range((unsigned long)vectors, (unsigned long)vectors + SZ_16K);
+	memunmap(vectors);
+	ctxr_entry = rvbar_vectors_pa + SZ_4K;
+	pr_info("Apple CTXR: EL1 CPU entry at %pa; VHE/KVM unavailable\n", &ctxr_entry);
+	return 0;
+}
+
 static int apple_rvbar_cpu_prepare(unsigned int cpu)
 {
 	if (!rvbar_mailbox) {
+		int ret;
+
 		rvbar_mailbox = ioremap(rvbar_mailbox_pa, sizeof(*rvbar_mailbox));
 		rvbar_cpu_start = ioremap(rvbar_cpu_start_pa, CPU_START_CORE(8));
 		if (!rvbar_mailbox || !rvbar_cpu_start)
 			return -ENOMEM;
+		if (apple_ctxr_active) {
+			ret = apple_ctxr_install_entry();
+			if (ret)
+				return ret;
+		}
 		/* From here every reset is the OS's: m1n1's memory belongs to Linux. */
 		writeq(RVBAR_MAILBOX_MAGIC, &rvbar_mailbox->magic);
 	}
@@ -171,7 +217,9 @@ static int apple_rvbar_spin_release(unsigned int cpu)
 
 	if (!release)
 		return -ENOMEM;
-	writeq_relaxed(__pa_symbol(secondary_entry), release);
+	if (apple_ctxr_active)
+		apple_rvbar_set_entry(cpu, __pa_symbol(secondary_entry));
+	writeq_relaxed(apple_ctxr_active ? ctxr_entry : __pa_symbol(secondary_entry), release);
 	dcache_clean_inval_poc((__force unsigned long)release,
 			       (__force unsigned long)release + sizeof(*release));
 	iounmap(release);
