@@ -111,40 +111,13 @@ SYM_CODE_START(apple_ctxr_el2_vectors)
 SYM_CODE_END(apple_ctxr_el2_vectors)
 
 SYM_CODE_START_LOCAL(apple_ctxr_el2_system_sleep)
-	/*
-	 * S2R debug: a 64-byte record per core in apple_ctxr_s2r_dbg, slot
-	 * (MPIDR Aff2 bit 0) << 3 | Aff0: +0x38 entry mark, +0x00 c6_2 before,
-	 * +0x08 after, +0x10 CNTHP_CTL_EL2, +0x18 CNTHV_CTL_EL2, +0x20 WFI
-	 * wakes, +0x28 ISR_EL1 after the last wake. EL2 runs with the MMU off.
-	 */
-	mrs	x9, mpidr_el1
-	ubfx	x10, x9, #16, #1
-	and	x11, x9, #7
-	orr	x10, x11, x10, lsl #3
-	adr	x12, apple_ctxr_s2r_dbg
-	add	x12, x12, x10, lsl #6
-	mov	x13, #0x5332
-	str	x13, [x12, #0x38]
-	dsb	sy
 	mrs_s	x1, sys_reg(3, 5, 15, 6, 2)
-	str	x1, [x12, #0x00]
 	orr	x1, x1, #1
 	orr	x1, x1, #(1 << 63)
 	msr_s	sys_reg(3, 5, 15, 6, 2), x1
-	mrs_s	x2, sys_reg(3, 5, 15, 6, 2)
-	str	x2, [x12, #0x08]
-	mrs_s	x2, sys_reg(3, 4, 14, 2, 1)
-	str	x2, [x12, #0x10]
-	mrs_s	x2, sys_reg(3, 4, 14, 3, 1)
-	str	x2, [x12, #0x18]
-	mov	x13, #0
-1:	str	x13, [x12, #0x20]
-	dsb	sy
+1:	dsb	sy
 	isb
 	wfi
-	add	x13, x13, #1
-	mrs	x14, isr_el1
-	str	x14, [x12, #0x28]
 	mov	x9, #1
 	msr_s	sys_reg(3, 5, 15, 1, 1), x9
 	b	1b
@@ -154,10 +127,6 @@ SYM_CODE_END(apple_ctxr_el2_system_sleep)
 SYM_DATA_START(apple_ctxr_mailbox)
 	.quad 0
 SYM_DATA_END(apple_ctxr_mailbox)
-	.balign 64
-SYM_DATA_START(apple_ctxr_s2r_dbg)
-	.fill	1024, 1, 0
-SYM_DATA_END(apple_ctxr_s2r_dbg)
 SYM_DATA_START(apple_ctxr_trampoline_end)
 SYM_DATA_END(apple_ctxr_trampoline_end)
 	.popsection
