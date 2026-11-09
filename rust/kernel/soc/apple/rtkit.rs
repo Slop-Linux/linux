@@ -302,6 +302,13 @@ impl<T: Operations> RtKit<T> {
         })
     }
 
+    /// Checks whether both the IOP and the AP power state are on, as the
+    /// coprocessor last acknowledged them.
+    pub fn is_running(self: Pin<&mut Self>) -> bool {
+        // SAFETY: `rtk` is valid per the type invariant.
+        unsafe { bindings::apple_rtkit_is_running(self.rtk) }
+    }
+
     /// Checks if an endpoint is present
     pub fn has_endpoint(self: Pin<&mut Self>, endpoint: u8) -> bool {
         unsafe { bindings::apple_rtkit_has_endpoint(self.rtk, endpoint) }
