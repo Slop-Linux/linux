@@ -101,7 +101,7 @@ static void __iomem *rvbar_cpu_start;
 u32 apple_ctxr_active __ro_after_init;
 static phys_addr_t rvbar_vectors_pa, ctxr_entry;
 extern char apple_ctxr_trampoline[], apple_ctxr_trampoline_end[];
-extern char apple_ctxr_mailbox[], apple_ctxr_el2_vectors[];
+extern char apple_ctxr_mailbox[], apple_ctxr_el2_vectors[], apple_ctxr_s2r_dbg[];
 /* Bit stride of a cluster in the packed start/stop mask: its largest core count. */
 static u32 rvbar_cluster_stride;
 
@@ -308,6 +308,13 @@ void __noreturn apple_rvbar_system_sleep(void)
 	unreachable();
 }
 EXPORT_SYMBOL_GPL(apple_rvbar_system_sleep);
+
+/* S2R debug: physical address of the EL2 sleep request's per-core records */
+phys_addr_t apple_rvbar_s2r_dbg_pa(void)
+{
+	return ctxr_entry + (apple_ctxr_s2r_dbg - apple_ctxr_trampoline);
+}
+EXPORT_SYMBOL_GPL(apple_rvbar_s2r_dbg_pa);
 
 /* ml_arm_sleep on a secondary in system sleep, run by the S2R driver. */
 static void (*apple_rvbar_sleep_die)(unsigned int cpu);
