@@ -10,6 +10,7 @@
 #include <linux/bitfield.h>
 #include <linux/bitmap.h>
 #include <linux/completion.h>
+#include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
