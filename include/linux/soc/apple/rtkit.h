@@ -163,11 +163,18 @@ int apple_rtkit_wake(struct apple_rtkit *rtk);
 void apple_rtkit_expect_iop_wake(struct apple_rtkit *rtk);
 
 /*
- * As apple_rtkit_expect_iop_wake(), for a firmware that restarts from DRAM
- * with HELLO: the endpoint map is echoed and no endpoint is started again
- * (the firmware keeps its buffers). last_mask filters the last part.
+ * S2R wake of a firmware kept in DRAM: outbox enable and the IOP power
+ * acknowledge expected; a HELLO and roll call are answered with the AP's
+ * started endpoints and nothing is started again. The caller then sets RUN
+ * and calls apple_rtkit_boot().
  */
-void apple_rtkit_warm_restart(struct apple_rtkit *rtk, u32 last_mask);
+void apple_rtkit_warm_restart(struct apple_rtkit *rtk);
+
+/*
+ * S2R stopCPU after apple_rtkit_idle(): outbox disable, then wait for the
+ * ASC idle bits. The caller clears RUN and bit 5.
+ */
+int apple_rtkit_stop_outbox(struct apple_rtkit *rtk);
 
 /*
  * Shutdown the co-processor

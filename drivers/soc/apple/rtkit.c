@@ -191,15 +191,17 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 		reply |= APPLE_RTKIT_MGMT_EPMAP_REPLY_MORE;
 
 	/*
-	 * macOS's reply to a firmware restarted from DRAM echoes the map, with
-	 * bit 1 added to the first part (DCP 0x51d -> 0x51f), and starts no
-	 * endpoint (aurora-silicon rtkit.c 296-316, measured under macOS).
+	 * A later roll call, a firmware restarted from DRAM: macOS answers each
+	 * part with its own enabled endpoints in that range (_buildRollCall,
+	 * K:b702708), management 0 and crashlog 1 among them since RTBuddy
+	 * creates both at first start (K:b6eed58, K:b6eee08), so DCP 0x51d is
+	 * answered 0x51f (measured by aurora-silicon). No endpoint is started:
+	 * STARTEP comes only from an endpoint enable (K:b701dac).
 	 */
 	if (rtk->warm_restart) {
-		if (msg & APPLE_RTKIT_MGMT_EPMAP_LAST)
-			reply |= bitmap & rtk->warm_last_mask;
-		else
-			reply |= bitmap | BIT_ULL(1);
+		reply |= bitmap_read(rtk->started, 32 * base, 32);
+		if (base == 0)
+			reply |= BIT_ULL(APPLE_RTKIT_EP_MGMT) | BIT_ULL(APPLE_RTKIT_EP_CRASHLOG);
 	}
 
 	apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_EPMAP_REPLY, reply);
@@ -738,6 +740,7 @@ int apple_rtkit_start_ep(struct apple_rtkit *rtk, u8 endpoint)
 	msg = FIELD_PREP(APPLE_RTKIT_MGMT_STARTEP_EP, endpoint);
 	msg |= APPLE_RTKIT_MGMT_STARTEP_FLAG;
 	apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_STARTEP, msg);
+	set_bit(endpoint, rtk->started);
 
 	return 0;
 }
@@ -768,6 +771,7 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 	init_completion(&rtk->ap_pwr_ack_completion);
 
 	bitmap_zero(rtk->endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
+	bitmap_zero(rtk->started, APPLE_RTKIT_MAX_ENDPOINTS);
 	set_bit(APPLE_RTKIT_EP_MGMT, rtk->endpoints);
 
 	if (mbox_name)
@@ -835,8 +839,10 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 	rtk->syslog_msg_buffer = NULL;
 	rtk->syslog_n_entries = 0;
 	rtk->syslog_msg_size = 0;
+	rtk->warm_restart = false;
 
 	bitmap_zero(rtk->endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
+	bitmap_zero(rtk->started, APPLE_RTKIT_MAX_ENDPOINTS);
 	set_bit(APPLE_RTKIT_EP_MGMT, rtk->endpoints);
 
 	reinit_completion(&rtk->epmap_completion);
@@ -897,6 +903,7 @@ int apple_rtkit_adopt_running(struct apple_rtkit *rtk, const u8 *endpoints,
 		return -EINVAL;
 
 	bitmap_zero(rtk->endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
+	bitmap_zero(rtk->started, APPLE_RTKIT_MAX_ENDPOINTS);
 	set_bit(APPLE_RTKIT_EP_MGMT, rtk->endpoints);
 	for (i = 0; i < n_endpoints; i++)
 		set_bit(endpoints[i], rtk->endpoints);
@@ -1170,14 +1177,40 @@ void apple_rtkit_expect_iop_wake(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_expect_iop_wake);
 
-void apple_rtkit_warm_restart(struct apple_rtkit *rtk, u32 last_mask)
+/*
+ * RTBuddy wake from S2R (startCPUWithOptions, K:8c08c4c): outbox enable
+ * (ASC+0x8114 bit 0, the mailbox I2A control), then the caller sets RUN and
+ * calls apple_rtkit_boot(). _iopValidate (K:b6efb78) waits only for the
+ * IOP's own power acknowledge; HELLO and the roll call are answered if the
+ * firmware sends them (warm_restart), not required.
+ */
+void apple_rtkit_warm_restart(struct apple_rtkit *rtk)
 {
 	rtk->warm_restart = true;
-	rtk->warm_last_mask = last_mask;
-	reinit_completion(&rtk->epmap_completion);
 	reinit_completion(&rtk->iop_pwr_ack_completion);
+	apple_mbox_set_outbox(rtk->mbox, true);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_warm_restart);
+
+/*
+ * AppleA7IOP::stopCPU's mailbox half on AppleASCWrapV6, after the IOP went
+ * idle: _enableOutbox(false) (K:8c0596c), then _isIdle's ASC+0x8000 & 3,
+ * retried at 1 ms up to ten times (K:8c05420..8c054b4, K:8c0909c..8c090e0).
+ * The caller clears RUN and bit 5 afterwards.
+ */
+int apple_rtkit_stop_outbox(struct apple_rtkit *rtk)
+{
+	int i;
+
+	apple_mbox_set_outbox(rtk->mbox, false);
+	for (i = 0; i < 10; i++) {
+		if (apple_mbox_idle(rtk->mbox))
+			return 0;
+		usleep_range(1000, 1500);
+	}
+	return -ETIMEDOUT;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_stop_outbox);
 
 void apple_rtkit_free(struct apple_rtkit *rtk)
 {

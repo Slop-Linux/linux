@@ -299,6 +299,24 @@ void apple_mbox_stop(struct apple_mbox *mbox)
 }
 EXPORT_SYMBOL(apple_mbox_stop);
 
+/* AppleASCWrapV6::_enableOutbox (K:8c0596c): bit 0 of the I2A control only */
+void apple_mbox_set_outbox(struct apple_mbox *mbox, bool enable)
+{
+	u32 v = readl(mbox->regs + mbox->hw->i2a_control);
+
+	writel(enable ? v | APPLE_ASC_MBOX_CONTROL_ENABLE :
+			v & ~APPLE_ASC_MBOX_CONTROL_ENABLE,
+	       mbox->regs + mbox->hw->i2a_control);
+}
+EXPORT_SYMBOL(apple_mbox_set_outbox);
+
+/* AppleASCWrapV6::_isIdle (K:8c05420): ASC+0x8000, the mailbox's first word, & 3 */
+bool apple_mbox_idle(struct apple_mbox *mbox)
+{
+	return readl(mbox->regs) & 3;
+}
+EXPORT_SYMBOL(apple_mbox_idle);
+
 struct apple_mbox *apple_mbox_get(struct device *dev, int index)
 {
 	struct of_phandle_args args;
