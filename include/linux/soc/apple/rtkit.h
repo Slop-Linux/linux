@@ -172,7 +172,8 @@ void apple_rtkit_warm_restart(struct apple_rtkit *rtk);
 
 /*
  * RTBuddy action 3 on S2R: the AP power state only (0x201 off, 0x20 on), with
- * the ping watchdog quiesced and re-armed.
+ * the ping watchdog quiesced and re-armed and the mailbox interrupt masked
+ * in between; claim-wake nubs drain and report the wake.
  */
 int apple_rtkit_set_ap_power(struct apple_rtkit *rtk, bool on);
 

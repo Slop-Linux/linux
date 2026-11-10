@@ -730,6 +730,9 @@ static void apple_rtkit_rx(struct apple_mbox *mbox, struct apple_mbox_msg msg,
 	 */
 	dma_rmb();
 
+	if (rtk->claim_draining)
+		set_bit(ep, rtk->wake_eps);
+
 	/* every inbound message re-arms the ping timer (K:b6f0504) */
 	if (READ_ONCE(rtk->watchdog_armed))
 		mod_delayed_work(system_wq, &rtk->ping_work,
@@ -848,6 +851,7 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 	INIT_DELAYED_WORK(&rtk->ping_work, apple_rtkit_ping_work);
 	/* ADT watchdog-enable on the RTBuddy nub */
 	rtk->watchdog = of_property_read_bool(dev->of_node, "apple,rtkit-watchdog");
+	rtk->claim_wake = of_property_read_bool(dev->of_node, "apple,rtkit-claim-wake");
 
 	bitmap_zero(rtk->endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
 	bitmap_zero(rtk->started, APPLE_RTKIT_MAX_ENDPOINTS);
@@ -1070,14 +1074,43 @@ static int apple_rtkit_set_ap_power_state(struct apple_rtkit *rtk,
 }
 
 /*
- * RTBuddy action 3 (AOP, MTP, SMC on S2R, _signalApStateAllRoutes): the AP
- * power state alone, 0x201 for sleep and 0x20 for wake, with the ping
- * watchdog quiesced and re-armed.
+ * RTBuddy action 3 (AOP, MTP, SMC on S2R; _changePowerState K:b6eccb8,
+ * _onPowerStateGated K:b701834, _signalApStateGated K:b6efc0c):
+ * sleep: AP 0x201 and its echo, the ping watchdog quiesced, mailbox
+ * interrupts masked (and, with claim-wake, the wake latched);
+ * wake: with claim-wake the mailbox is drained while still masked and the
+ * endpoints that had messages reported as the wake reason
+ * (reportWakeReason), then the interrupts unmasked, the watchdog re-armed and
+ * AP 0x20 sent with its echo.
  */
 int apple_rtkit_set_ap_power(struct apple_rtkit *rtk, bool on)
 {
-	return apple_rtkit_set_ap_power_state(rtk, on ? APPLE_RTKIT_PWR_STATE_ON :
-							APPLE_RTKIT_PWR_STATE_IDLE);
+	int ret, ep;
+
+	if (!on) {
+		ret = apple_rtkit_set_ap_power_state(rtk, APPLE_RTKIT_PWR_STATE_IDLE);
+		if (ret)
+			return ret;
+		disable_irq(rtk->mbox->irq_recv_not_empty);
+		rtk->irq_off = true;
+		return 0;
+	}
+
+	if (rtk->irq_off) {
+		if (rtk->claim_wake) {
+			bitmap_zero(rtk->wake_eps, APPLE_RTKIT_MAX_ENDPOINTS);
+			rtk->claim_draining = true;
+			apple_mbox_poll(rtk->mbox);
+			rtk->claim_draining = false;
+			for_each_set_bit(ep, rtk->wake_eps, APPLE_RTKIT_MAX_ENDPOINTS)
+				dev_info(rtk->dev, "RTKit: wake reason: endpoint %#x\n", ep);
+			if (!bitmap_empty(rtk->wake_eps, APPLE_RTKIT_MAX_ENDPOINTS))
+				pm_wakeup_event(rtk->dev, 0);
+		}
+		rtk->irq_off = false;
+		enable_irq(rtk->mbox->irq_recv_not_empty);
+	}
+	return apple_rtkit_set_ap_power_state(rtk, APPLE_RTKIT_PWR_STATE_ON);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_set_ap_power);
 

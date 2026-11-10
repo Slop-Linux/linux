@@ -18,6 +18,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/pm_wakeup.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/mailbox.h>
 #include <linux/soc/apple/rtkit.h>
@@ -67,6 +68,11 @@ struct apple_rtkit {
 	unsigned long ping_since;
 	unsigned int ping_send_fails;
 	struct completion ping_ack_completion;
+
+	/* claim-wake (ADT, DT apple,rtkit-claim-wake): the wake drains and reports */
+	bool claim_wake;
+	bool claim_draining;
+	DECLARE_BITMAP(wake_eps, APPLE_RTKIT_MAX_ENDPOINTS);
 
 	DECLARE_BITMAP(endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
 	/* endpoints the AP started: macOS answers a later roll call with its enabled set */

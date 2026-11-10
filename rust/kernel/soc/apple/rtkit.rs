@@ -274,6 +274,16 @@ impl<T: Operations> RtKit<T> {
         to_result(unsafe { bindings::apple_rtkit_idle(self.rtk) })
     }
 
+    /// RTBuddy action 3 on system sleep: AP power state 0x201 (`on` false) or
+    /// 0x20 (`on` true) and its echo, with the ping watchdog and the mailbox
+    /// interrupt quiesced in between. It waits for the coprocessor and may run
+    /// the message work, so the caller must not hold a lock the receive
+    /// callbacks take.
+    pub fn set_ap_power(&self, on: bool) -> Result {
+        // SAFETY: `rtk` is valid per the type invariant.
+        to_result(unsafe { bindings::apple_rtkit_set_ap_power(self.rtk, on) })
+    }
+
     /// Stops and restarts the mailbox, frees the firmware-requested buffers and
     /// forgets the endpoint map, ready for a coprocessor restart and `boot`.
     pub fn reinit(self: Pin<&mut Self>) -> Result {
