@@ -27,11 +27,14 @@ enum {
 	APPLE_RTKIT_EP_TRACEKIT = 0xa,
 };
 
-#define APPLE_RTKIT_MGMT_TYPE GENMASK_ULL(59, 52)
+/* RTBuddyManagementEndpoint::_messageHandler: ubfx #52, #4 (K:b7013c0) */
+#define APPLE_RTKIT_MGMT_TYPE GENMASK_ULL(55, 52)
 
 enum {
 	APPLE_RTKIT_MGMT_HELLO = 1,
 	APPLE_RTKIT_MGMT_HELLO_REPLY = 2,
+	APPLE_RTKIT_MGMT_PING = 3,
+	APPLE_RTKIT_MGMT_PING_ACK = 4,
 	APPLE_RTKIT_MGMT_STARTEP = 5,
 	APPLE_RTKIT_MGMT_SET_IOP_PWR_STATE = 6,
 	APPLE_RTKIT_MGMT_SET_IOP_PWR_STATE_ACK = 7,
@@ -39,16 +42,26 @@ enum {
 	APPLE_RTKIT_MGMT_EPMAP_REPLY = 8,
 	APPLE_RTKIT_MGMT_SET_AP_PWR_STATE = 0xb,
 	APPLE_RTKIT_MGMT_SET_AP_PWR_STATE_ACK = 0xb,
+	/* idle-msg (_handlePowerIdleGated); no J713 nub has idle-msg */
+	APPLE_RTKIT_MGMT_POWER_IDLE = 0xc,
 };
+
+/* RTBuddy: timeout = the nub's "timeout" (s), 20 by default; no J713 nub has one */
+#define APPLE_RTKIT_TIMEOUT_MS 20000
+/* ping period = timeout * 1000 / rtb_ping_rate (10) (K:b6f2854, K:b70124c) */
+#define APPLE_RTKIT_PING_RATE 10
+#define APPLE_RTKIT_PING_PERIOD_MS (APPLE_RTKIT_TIMEOUT_MS / APPLE_RTKIT_PING_RATE)
+/* _handleHello: refused versions are answered with this and fail validation */
+#define APPLE_RTKIT_MGMT_HELLO_BAD 0xffff0badULL
 
 #define APPLE_RTKIT_MGMT_HELLO_MINVER GENMASK_ULL(15, 0)
 #define APPLE_RTKIT_MGMT_HELLO_MAXVER GENMASK_ULL(31, 16)
 
 #define APPLE_RTKIT_MGMT_EPMAP_LAST   BIT_ULL(51)
-#define APPLE_RTKIT_MGMT_EPMAP_BASE   GENMASK_ULL(34, 32)
+/* roll-call part, bits 37:32, echoed with bit 51 (K:b7022c0, K:b702334) */
+#define APPLE_RTKIT_MGMT_EPMAP_BASE   GENMASK_ULL(37, 32)
 #define APPLE_RTKIT_MGMT_EPMAP_BITMAP GENMASK_ULL(31, 0)
 
-#define APPLE_RTKIT_MGMT_EPMAP_REPLY_MORE BIT_ULL(0)
 
 #define APPLE_RTKIT_MGMT_STARTEP_EP   GENMASK_ULL(39, 32)
 #define APPLE_RTKIT_MGMT_STARTEP_FLAG BIT_ULL(1)
@@ -85,7 +98,6 @@ enum {
 #define APPLE_RTKIT_OSLOG_SIZE GENMASK_ULL(55, 36)
 #define APPLE_RTKIT_OSLOG_IOVA GENMASK_ULL(35, 0)
 
-#define APPLE_RTKIT_MIN_SUPPORTED_VERSION 11
 #define APPLE_RTKIT_MAX_SUPPORTED_VERSION 12
 
 struct apple_rtkit_rx_work {
@@ -128,49 +140,60 @@ static int apple_rtkit_management_send(struct apple_rtkit *rtk, u8 type,
 	return ret;
 }
 
+/*
+ * RTBuddyManagementEndpoint::_handleHello (K:b702034): the firmware's range
+ * must hold 12 (min <= 12 <= max); then the reply is 12/12, upper bits 0
+ * (bit 33 = mgmt+0x120, only zeroed; bit 32 is 0 on production). Otherwise
+ * the reply is 0xffff0bad and validation fails.
+ */
 static void apple_rtkit_management_rx_hello(struct apple_rtkit *rtk, u64 msg)
 {
 	u64 reply;
 
 	int min_ver = FIELD_GET(APPLE_RTKIT_MGMT_HELLO_MINVER, msg);
 	int max_ver = FIELD_GET(APPLE_RTKIT_MGMT_HELLO_MAXVER, msg);
-	int want_ver = min(APPLE_RTKIT_MAX_SUPPORTED_VERSION, max_ver);
 
 	dev_dbg(rtk->dev, "RTKit: Min ver %d, max ver %d\n", min_ver, max_ver);
 
-	if (min_ver > APPLE_RTKIT_MAX_SUPPORTED_VERSION) {
-		dev_err(rtk->dev, "RTKit: Firmware min version %d is too new\n",
-			min_ver);
-		goto abort_boot;
-	}
-
-	if (max_ver < APPLE_RTKIT_MIN_SUPPORTED_VERSION) {
-		dev_err(rtk->dev, "RTKit: Firmware max version %d is too old\n",
-			max_ver);
-		goto abort_boot;
+	if (min_ver > APPLE_RTKIT_MAX_SUPPORTED_VERSION ||
+	    max_ver < APPLE_RTKIT_MAX_SUPPORTED_VERSION) {
+		dev_err(rtk->dev, "RTKit: Firmware versions %d..%d exclude %d\n",
+			min_ver, max_ver, APPLE_RTKIT_MAX_SUPPORTED_VERSION);
+		apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_HELLO_REPLY,
+					    APPLE_RTKIT_MGMT_HELLO_BAD);
+		rtk->boot_result = -EINVAL;
+		complete_all(&rtk->epmap_completion);
+		complete_all(&rtk->iop_pwr_ack_completion);
+		return;
 	}
 
 	dev_info(rtk->dev, "RTKit: Initializing (protocol version %d)\n",
-		 want_ver);
-	rtk->version = want_ver;
+		 APPLE_RTKIT_MAX_SUPPORTED_VERSION);
+	rtk->version = APPLE_RTKIT_MAX_SUPPORTED_VERSION;
 
-	reply = FIELD_PREP(APPLE_RTKIT_MGMT_HELLO_MINVER, want_ver);
-	reply |= FIELD_PREP(APPLE_RTKIT_MGMT_HELLO_MAXVER, want_ver);
+	reply = FIELD_PREP(APPLE_RTKIT_MGMT_HELLO_MINVER, APPLE_RTKIT_MAX_SUPPORTED_VERSION);
+	reply |= FIELD_PREP(APPLE_RTKIT_MGMT_HELLO_MAXVER, APPLE_RTKIT_MAX_SUPPORTED_VERSION);
 	apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_HELLO_REPLY, reply);
-
-	return;
-
-abort_boot:
-	rtk->boot_result = -EINVAL;
-	complete_all(&rtk->epmap_completion);
 }
 
+/*
+ * RTBuddyManagementEndpoint::_handleEPRollCall (K:b702288). The reply echoes
+ * the part (bits 37:32) and the last bit, with the low word:
+ * - first roll call: (part == 0) (K:b70230c-b702310); its last part sets
+ *   rollcall_done (mgmt+0x121, K:b70231c), cleared only by reinit;
+ * - every later one (a firmware restarted from DRAM after S2R): the AP's
+ *   existing and enabled endpoints in that range (_buildRollCall,
+ *   K:b702708), management 0 and crashlog 1 among them since RTBuddy creates
+ *   both at first start (K:b6eed58, K:b6eee08); nothing is started, STARTEP
+ *   comes only from an endpoint enable (K:b701dac).
+ */
 static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 {
 	int i, ep;
 	u64 reply;
 	unsigned long bitmap = FIELD_GET(APPLE_RTKIT_MGMT_EPMAP_BITMAP, msg);
 	u32 base = FIELD_GET(APPLE_RTKIT_MGMT_EPMAP_BASE, msg);
+	bool later = rtk->rollcall_done;
 
 	dev_dbg(rtk->dev,
 		"RTKit: received endpoint bitmap 0x%lx with base 0x%x\n",
@@ -180,25 +203,14 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 		ep = 32 * base + i;
 		dev_dbg(rtk->dev, "RTKit: Discovered endpoint 0x%02x\n", ep);
 		set_bit(ep, rtk->endpoints);
-		if (!rtk->warm_restart && rtk->early_crashlog && ep == APPLE_RTKIT_EP_CRASHLOG)
+		if (!later && rtk->early_crashlog && ep == APPLE_RTKIT_EP_CRASHLOG)
 			apple_rtkit_start_ep(rtk, ep);
 	}
 
-	reply = FIELD_PREP(APPLE_RTKIT_MGMT_EPMAP_BASE, base);
-	if (msg & APPLE_RTKIT_MGMT_EPMAP_LAST)
-		reply |= APPLE_RTKIT_MGMT_EPMAP_LAST;
-	else
-		reply |= APPLE_RTKIT_MGMT_EPMAP_REPLY_MORE;
-
-	/*
-	 * A later roll call, a firmware restarted from DRAM: macOS answers each
-	 * part with its own enabled endpoints in that range (_buildRollCall,
-	 * K:b702708), management 0 and crashlog 1 among them since RTBuddy
-	 * creates both at first start (K:b6eed58, K:b6eee08), so DCP 0x51d is
-	 * answered 0x51f (measured by aurora-silicon). No endpoint is started:
-	 * STARTEP comes only from an endpoint enable (K:b701dac).
-	 */
-	if (rtk->warm_restart) {
+	reply = msg & (APPLE_RTKIT_MGMT_EPMAP_BASE | APPLE_RTKIT_MGMT_EPMAP_LAST);
+	if (!later) {
+		reply |= base == 0;
+	} else {
 		reply |= bitmap_read(rtk->started, 32 * base, 32);
 		if (base == 0)
 			reply |= BIT_ULL(APPLE_RTKIT_EP_MGMT) | BIT_ULL(APPLE_RTKIT_EP_CRASHLOG);
@@ -209,12 +221,12 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 	if (!(msg & APPLE_RTKIT_MGMT_EPMAP_LAST))
 		return;
 
-	if (rtk->warm_restart) {
-		rtk->warm_restart = false;
+	if (later) {
 		rtk->boot_result = 0;
 		complete_all(&rtk->epmap_completion);
 		return;
 	}
+	rtk->rollcall_done = true;
 
 	for_each_set_bit(ep, rtk->endpoints, APPLE_RTKIT_APP_ENDPOINT_START) {
 		if (rtk->early_crashlog && ep == APPLE_RTKIT_EP_CRASHLOG)
@@ -248,6 +260,10 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 	complete_all(&rtk->epmap_completion);
 }
 
+/*
+ * _handlePowerAck (K:b7024d0) decodes the low byte: 1 or 2 is idle, 0 off,
+ * 0x20 on; the waiters check it.
+ */
 static void apple_rtkit_management_rx_iop_pwr_ack(struct apple_rtkit *rtk,
 						  u64 msg)
 {
@@ -260,16 +276,27 @@ static void apple_rtkit_management_rx_iop_pwr_ack(struct apple_rtkit *rtk,
 	complete_all(&rtk->iop_pwr_ack_completion);
 }
 
+/* the AP state echo: low 32 bits (mgmt+0x108, K:b701488) */
 static void apple_rtkit_management_rx_ap_pwr_ack(struct apple_rtkit *rtk,
 						 u64 msg)
 {
-	unsigned int new_state = FIELD_GET(APPLE_RTKIT_MGMT_PWR_STATE, msg);
+	unsigned int new_state = lower_32_bits(msg);
 
 	dev_dbg(rtk->dev, "RTKit: AP power state transition: 0x%x -> 0x%x\n",
 		rtk->ap_power_state, new_state);
 	rtk->ap_power_state = new_state;
 
 	complete_all(&rtk->ap_pwr_ack_completion);
+}
+
+/* ping acknowledge (K:b7023d0): the low 32 bits echo the next counter */
+static void apple_rtkit_management_rx_ping_ack(struct apple_rtkit *rtk, u64 msg)
+{
+	if (lower_32_bits(msg) != rtk->ping_acked)
+		panic("%s: RTKit: ping ack %#x, expected %#x\n", dev_name(rtk->dev),
+		      lower_32_bits(msg), rtk->ping_acked);
+	rtk->ping_acked++;
+	complete_all(&rtk->ping_ack_completion);
 }
 
 static void apple_rtkit_management_rx(struct apple_rtkit *rtk, u64 msg)
@@ -280,6 +307,9 @@ static void apple_rtkit_management_rx(struct apple_rtkit *rtk, u64 msg)
 	case APPLE_RTKIT_MGMT_HELLO:
 		apple_rtkit_management_rx_hello(rtk, msg);
 		break;
+	case APPLE_RTKIT_MGMT_PING_ACK:
+		apple_rtkit_management_rx_ping_ack(rtk, msg);
+		break;
 	case APPLE_RTKIT_MGMT_EPMAP:
 		apple_rtkit_management_rx_epmap(rtk, msg);
 		break;
@@ -289,12 +319,38 @@ static void apple_rtkit_management_rx(struct apple_rtkit *rtk, u64 msg)
 	case APPLE_RTKIT_MGMT_SET_AP_PWR_STATE_ACK:
 		apple_rtkit_management_rx_ap_pwr_ack(rtk, msg);
 		break;
+	case APPLE_RTKIT_MGMT_POWER_IDLE:
+		/* _handlePowerIdleGated: only nubs with idle-msg, none on J713 */
+		break;
 	default:
-		dev_warn(
-			rtk->dev,
-			"RTKit: unknown management message: 0x%llx (type: 0x%02x)\n",
-			msg, type);
+		/* any other type panics (_messageHandler.cold.1, K:b701554) */
+		panic("%s: RTKit: unknown management message %#llx\n",
+		      dev_name(rtk->dev), msg);
 	}
+}
+
+/*
+ * A repeated request (iova 0) for a buffer that is kept, large enough:
+ * RTBuddy keeps the buffers across power state 0 (powerStatePreservesMemory
+ * = state < 3, K:b6f7028) and answers with the same address (syslog
+ * K:b707cb4-b707e68, IOReport K:b6f8474). Returns true when answered.
+ */
+static bool apple_rtkit_reuse_buffer(struct apple_rtkit *rtk,
+				     struct apple_rtkit_shmem *buffer, u8 ep,
+				     u64 msg)
+{
+	size_t size = FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_SIZE, msg) << 12;
+	u64 reply;
+
+	if (!buffer->size || FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_IOVA, msg) ||
+	    size > buffer->size)
+		return false;
+
+	reply = FIELD_PREP(APPLE_RTKIT_SYSLOG_TYPE, APPLE_RTKIT_BUFFER_REQUEST);
+	reply |= FIELD_PREP(APPLE_RTKIT_BUFFER_REQUEST_SIZE, buffer->size >> 12);
+	reply |= FIELD_PREP(APPLE_RTKIT_BUFFER_REQUEST_IOVA, buffer->iova);
+	apple_rtkit_send_message(rtk, ep, reply, NULL, false);
+	return true;
 }
 
 static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
@@ -449,14 +505,20 @@ static void apple_rtkit_ioreport_rx(struct apple_rtkit *rtk, u64 msg)
 
 	switch (type) {
 	case APPLE_RTKIT_BUFFER_REQUEST:
+		if (apple_rtkit_reuse_buffer(rtk, &rtk->ioreport_buffer, APPLE_RTKIT_EP_IOREPORT, msg))
+			break;
 		apple_rtkit_common_rx_get_buffer(rtk, &rtk->ioreport_buffer,
 						 APPLE_RTKIT_EP_IOREPORT, msg);
 		break;
-	/* unknown, must be ACKed or the co-processor will hang */
+	/*
+	 * 0x8: _updateRemoteReportersGated, then a bare type-8 reply; 0xc: a
+	 * flag (+0xba), no reply (K:b6f82dc)
+	 */
 	case 0x8:
+		apple_rtkit_send_message(rtk, APPLE_RTKIT_EP_IOREPORT,
+					 FIELD_PREP(APPLE_RTKIT_SYSLOG_TYPE, 0x8), NULL, false);
+		break;
 	case 0xc:
-		apple_rtkit_send_message(rtk, APPLE_RTKIT_EP_IOREPORT, msg,
-					 NULL, false);
 		break;
 	default:
 		dev_warn(rtk->dev, "RTKit: Unknown ioreport message: %llx\n",
@@ -545,7 +607,10 @@ static void apple_rtkit_syslog_rx_log(struct apple_rtkit *rtk, u64 msg)
 		 rtk->syslog_msg_buffer);
 
 done:
-	apple_rtkit_send_message(rtk, APPLE_RTKIT_EP_SYSLOG, msg, NULL, false);
+	/* the log ack is type 5 with the low 32 bits only (K:b707950) */
+	apple_rtkit_send_message(rtk, APPLE_RTKIT_EP_SYSLOG,
+				 FIELD_PREP(APPLE_RTKIT_SYSLOG_TYPE, APPLE_RTKIT_SYSLOG_LOG) |
+				 lower_32_bits(msg), NULL, false);
 }
 
 static void apple_rtkit_syslog_rx(struct apple_rtkit *rtk, u64 msg)
@@ -554,6 +619,8 @@ static void apple_rtkit_syslog_rx(struct apple_rtkit *rtk, u64 msg)
 
 	switch (type) {
 	case APPLE_RTKIT_BUFFER_REQUEST:
+		if (apple_rtkit_reuse_buffer(rtk, &rtk->syslog_buffer, APPLE_RTKIT_EP_SYSLOG, msg))
+			break;
 		apple_rtkit_common_rx_get_buffer(rtk, &rtk->syslog_buffer,
 						 APPLE_RTKIT_EP_SYSLOG, msg);
 		break;
@@ -645,6 +712,7 @@ static void apple_rtkit_rx_work(struct work_struct *work)
 			 rtk_work->ep, rtk_work->msg);
 	}
 
+	WRITE_ONCE(rtk->rx_handled, rtk->rx_handled + 1);
 	kfree(rtk_work);
 }
 
@@ -661,6 +729,11 @@ static void apple_rtkit_rx(struct apple_mbox *mbox, struct apple_mbox_msg msg,
 	 * afterwards.
 	 */
 	dma_rmb();
+
+	/* every inbound message re-arms the ping timer (K:b6f0504) */
+	if (READ_ONCE(rtk->watchdog_armed))
+		mod_delayed_work(system_wq, &rtk->ping_work,
+				 msecs_to_jiffies(APPLE_RTKIT_PING_PERIOD_MS));
 
 	if (!test_bit(ep, rtk->endpoints))
 		dev_warn(rtk->dev,
@@ -746,6 +819,8 @@ int apple_rtkit_start_ep(struct apple_rtkit *rtk, u8 endpoint)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_start_ep);
 
+static void apple_rtkit_ping_work(struct work_struct *work);
+
 struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 					    const char *mbox_name, int mbox_idx,
 					    const struct apple_rtkit_ops *ops)
@@ -769,6 +844,10 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 	init_completion(&rtk->epmap_completion);
 	init_completion(&rtk->iop_pwr_ack_completion);
 	init_completion(&rtk->ap_pwr_ack_completion);
+	init_completion(&rtk->ping_ack_completion);
+	INIT_DELAYED_WORK(&rtk->ping_work, apple_rtkit_ping_work);
+	/* ADT watchdog-enable on the RTBuddy nub */
+	rtk->watchdog = of_property_read_bool(dev->of_node, "apple,rtkit-watchdog");
 
 	bitmap_zero(rtk->endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
 	bitmap_zero(rtk->started, APPLE_RTKIT_MAX_ENDPOINTS);
@@ -808,22 +887,114 @@ free_rtk:
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_init);
 
-static int apple_rtkit_wait_for_completion(struct completion *c)
+/*
+ * RTBuddy's waits (K:b6eeed8, K:b701f28, K:b6eff04): commandSleep for the
+ * nub's timeout (20 s), not interruptible. On a timeout the management
+ * endpoint's checkForWork (K:b05e204) handles a queued message, and if there
+ * was one the full timeout starts again; otherwise the wait fails.
+ */
+static int apple_rtkit_wait_for_completion(struct apple_rtkit *rtk,
+					   struct completion *c)
 {
-	long t;
+	unsigned long handled;
 
-	t = wait_for_completion_interruptible_timeout(c,
-						      msecs_to_jiffies(1000));
-	if (t < 0)
-		return t;
-	else if (t == 0)
-		return -ETIME;
-	else
-		return 0;
+	for (;;) {
+		if (wait_for_completion_timeout(c, msecs_to_jiffies(APPLE_RTKIT_TIMEOUT_MS)))
+			return 0;
+		handled = READ_ONCE(rtk->rx_handled);
+		flush_workqueue(rtk->wq);
+		if (completion_done(c))
+			return 0;
+		if (READ_ONCE(rtk->rx_handled) == handled)
+			return -ETIME;
+	}
 }
+
+/*
+ * RTBuddy ping watchdog, nubs with watchdog-enable (AOP, MTP, SMC, DCP,
+ * dcpext): after the ping period with no inbound message
+ * (_watchdogSendPing, K:b702880-b7028c0) send type 3, the sequence and
+ * (mach_absolute_time & 0xffff) << 32; each type 4 echoes the next counter.
+ * An outstanding ping after a check for work for the whole timeout, or
+ * rtb_ping_rate failed sends, is a crash (K:b70279c).
+ */
+static void apple_rtkit_ping_work(struct work_struct *work)
+{
+	struct apple_rtkit *rtk =
+		container_of(to_delayed_work(work), struct apple_rtkit, ping_work);
+	u64 msg;
+
+	if (rtk->ping_sent != rtk->ping_acked) {
+		flush_workqueue(rtk->wq);
+		if (rtk->ping_sent != rtk->ping_acked &&
+		    time_after(jiffies, rtk->ping_since + msecs_to_jiffies(APPLE_RTKIT_TIMEOUT_MS))) {
+			dev_err(rtk->dev, "RTKit: ping timeout\n");
+			rtk->crashed = true;
+			return;
+		}
+	} else {
+		msg = rtk->ping_sent;
+		msg |= (arch_timer_read_counter() & 0xffff) << 32;
+		if (apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_PING, msg)) {
+			if (++rtk->ping_send_fails >= APPLE_RTKIT_PING_RATE) {
+				dev_err(rtk->dev, "RTKit: ping send failed\n");
+				rtk->crashed = true;
+				return;
+			}
+		} else {
+			rtk->ping_sent++;
+			rtk->ping_since = jiffies;
+		}
+	}
+	if (READ_ONCE(rtk->watchdog_armed))
+		mod_delayed_work(system_wq, &rtk->ping_work,
+				 msecs_to_jiffies(APPLE_RTKIT_PING_PERIOD_MS));
+}
+
+/* _onPowerStateGated(1, 1) (K:b701868-b7018f0): counters reset, timer re-armed */
+static void apple_rtkit_watchdog_arm(struct apple_rtkit *rtk)
+{
+	if (!rtk->watchdog)
+		return;
+	rtk->ping_sent = 0;
+	rtk->ping_acked = 0;
+	rtk->ping_send_fails = 0;
+	WRITE_ONCE(rtk->watchdog_armed, true);
+	mod_delayed_work(system_wq, &rtk->ping_work,
+			 msecs_to_jiffies(APPLE_RTKIT_PING_PERIOD_MS));
+}
+
+/*
+ * _quiesceWatchdogGated (K:b701ad4), after AP 0x201: wait for the
+ * outstanding ping's ack, then cancel the timer.
+ */
+static int apple_rtkit_watchdog_quiesce(struct apple_rtkit *rtk)
+{
+	if (!rtk->watchdog || !rtk->watchdog_armed)
+		return 0;
+	WRITE_ONCE(rtk->watchdog_armed, false);
+	cancel_delayed_work_sync(&rtk->ping_work);
+	while (rtk->ping_sent != rtk->ping_acked) {
+		reinit_completion(&rtk->ping_ack_completion);
+		if (rtk->ping_sent == rtk->ping_acked)
+			break;
+		if (apple_rtkit_wait_for_completion(rtk, &rtk->ping_ack_completion)) {
+			dev_err(rtk->dev, "RTKit: failed to quiesce watchdog\n");
+			return -ETIME;
+		}
+	}
+	return 0;
+}
+
 
 int apple_rtkit_reinit(struct apple_rtkit *rtk)
 {
+	if (rtk->irq_off) {
+		rtk->irq_off = false;
+		enable_irq(rtk->mbox->irq_recv_not_empty);
+	}
+	WRITE_ONCE(rtk->watchdog_armed, false);
+	cancel_delayed_work_sync(&rtk->ping_work);
 	/* make sure we don't handle any messages while reinitializing */
 	apple_mbox_stop(rtk->mbox);
 	flush_workqueue(rtk->wq);
@@ -839,7 +1010,7 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 	rtk->syslog_msg_buffer = NULL;
 	rtk->syslog_n_entries = 0;
 	rtk->syslog_msg_size = 0;
-	rtk->warm_restart = false;
+	rtk->rollcall_done = false;
 
 	bitmap_zero(rtk->endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
 	bitmap_zero(rtk->started, APPLE_RTKIT_MAX_ENDPOINTS);
@@ -858,28 +1029,57 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_reinit);
 
+/*
+ * _signalApPowerGated (K:b7019cc): nothing is sent when the last echo (its
+ * low 32 bits) already is the state; otherwise send and wait for the echo.
+ * _onPowerStateGated: going to 0x20 the ping watchdog is re-armed first
+ * (K:b701868-b7018f0); going to 0x201 it is quiesced after the echo
+ * (K:b701ad4).
+ */
 static int apple_rtkit_set_ap_power_state(struct apple_rtkit *rtk,
 					  unsigned int state)
 {
 	u64 msg;
 	int ret;
 
-	reinit_completion(&rtk->ap_pwr_ack_completion);
+	if (state == APPLE_RTKIT_PWR_STATE_ON)
+		apple_rtkit_watchdog_arm(rtk);
 
-	msg = FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE, state);
-	ret = apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_SET_AP_PWR_STATE,
-					  msg);
-	if (ret)
-		return ret;
+	if (rtk->ap_power_state != state) {
+		reinit_completion(&rtk->ap_pwr_ack_completion);
 
-	ret = apple_rtkit_wait_for_completion(&rtk->ap_pwr_ack_completion);
-	if (ret)
-		return ret;
+		msg = FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE, state);
+		ret = apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_SET_AP_PWR_STATE,
+						  msg);
+		if (ret)
+			return ret;
 
-	if (rtk->ap_power_state != state)
-		return -EINVAL;
+		ret = apple_rtkit_wait_for_completion(rtk, &rtk->ap_pwr_ack_completion);
+		if (ret) {
+			dev_err(rtk->dev, "RTKit: no response to AP power state %#x\n", state);
+			return ret;
+		}
+
+		if (rtk->ap_power_state != state)
+			return -EINVAL;
+	}
+
+	if (state == APPLE_RTKIT_PWR_STATE_IDLE)
+		return apple_rtkit_watchdog_quiesce(rtk);
 	return 0;
 }
+
+/*
+ * RTBuddy action 3 (AOP, MTP, SMC on S2R, _signalApStateAllRoutes): the AP
+ * power state alone, 0x201 for sleep and 0x20 for wake, with the ping
+ * watchdog quiesced and re-armed.
+ */
+int apple_rtkit_set_ap_power(struct apple_rtkit *rtk, bool on)
+{
+	return apple_rtkit_set_ap_power_state(rtk, on ? APPLE_RTKIT_PWR_STATE_ON :
+							APPLE_RTKIT_PWR_STATE_IDLE);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_set_ap_power);
 
 void apple_rtkit_set_boot_ap_power(struct apple_rtkit *rtk, bool enable)
 {
@@ -913,11 +1113,13 @@ int apple_rtkit_adopt_running(struct apple_rtkit *rtk, const u8 *endpoints,
 	 * message may be replayed into that session. */
 	rtk->version = APPLE_RTKIT_MAX_SUPPORTED_VERSION;
 	rtk->boot_result = 0;
+	rtk->rollcall_done = true;
 	rtk->iop_power_state = APPLE_RTKIT_PWR_STATE_ON;
 	rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_ON;
 	complete_all(&rtk->epmap_completion);
 	complete_all(&rtk->iop_pwr_ack_completion);
 	complete_all(&rtk->ap_pwr_ack_completion);
+	apple_rtkit_watchdog_arm(rtk);
 
 	dev_info(rtk->dev, "RTKit: adopted running bootloader session\n");
 	return 0;
@@ -1004,10 +1206,14 @@ static int apple_rtkit_set_iop_power_state(struct apple_rtkit *rtk,
 	if (ret)
 		return ret;
 
-	ret = apple_rtkit_wait_for_completion(&rtk->iop_pwr_ack_completion);
+	ret = apple_rtkit_wait_for_completion(rtk, &rtk->iop_pwr_ack_completion);
 	if (ret)
 		return ret;
 
+	/* _handlePowerAck (K:b7024d0): the low byte 1 or 2 is idle */
+	if (state == APPLE_RTKIT_PWR_STATE_IDLE)
+		return ((rtk->iop_power_state & 0xff) == 1 ||
+			(rtk->iop_power_state & 0xff) == 2) ? 0 : -EINVAL;
 	if (rtk->iop_power_state != state)
 		return -EINVAL;
 	return 0;
@@ -1023,7 +1229,7 @@ int apple_rtkit_boot(struct apple_rtkit *rtk)
 		return -EINVAL;
 
 	dev_dbg(rtk->dev, "RTKit: waiting for boot to finish\n");
-	ret = apple_rtkit_wait_for_completion(&rtk->epmap_completion);
+	ret = apple_rtkit_wait_for_completion(rtk, &rtk->epmap_completion);
 	if (ret) {
 		dev_err(rtk->dev, "RTKit: timed out waiting for endpoint map: %d\n", ret);
 		return ret;
@@ -1032,15 +1238,20 @@ int apple_rtkit_boot(struct apple_rtkit *rtk)
 		return rtk->boot_result;
 
 	dev_dbg(rtk->dev, "RTKit: waiting for IOP power state ACK\n");
-	ret = apple_rtkit_wait_for_completion(&rtk->iop_pwr_ack_completion);
+	ret = apple_rtkit_wait_for_completion(rtk, &rtk->iop_pwr_ack_completion);
 	if (ret) {
 		dev_err(rtk->dev,
 			"RTKit: timed out waiting for IOP power ACK (state %#x): %d\n",
 			rtk->iop_power_state, ret);
 		return ret;
 	}
+	/* _iopValidate (K:b6efb78) waits for status 8: the type-7 low byte 0x20 */
+	if ((rtk->iop_power_state & 0xff) != APPLE_RTKIT_PWR_STATE_ON) {
+		dev_err(rtk->dev, "RTKit: IOP power ACK %#x is not on\n", rtk->iop_power_state);
+		return -EINVAL;
+	}
 	if (rtk->early_crashlog) {
-		ret = apple_rtkit_wait_for_completion(&rtk->crashlog_completion);
+		ret = apple_rtkit_wait_for_completion(rtk, &rtk->crashlog_completion);
 		if (ret) {
 			dev_err(rtk->dev, "RTKit: timed out waiting for crash buffer: %d\n", ret);
 			return ret;
@@ -1049,6 +1260,7 @@ int apple_rtkit_boot(struct apple_rtkit *rtk)
 	if (!rtk->boot_ap_power) {
 		dev_dbg(rtk->dev, "RTKit: reusing boot AP power ownership\n");
 		rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_ON;
+		apple_rtkit_watchdog_arm(rtk);
 		return 0;
 	}
 
@@ -1109,6 +1321,14 @@ int apple_rtkit_idle(struct apple_rtkit *rtk)
 	if (ret)
 		return ret;
 
+	/*
+	 * enableMailboxInterrupts(false), then every endpoint drained
+	 * (agent-rtbuddy-action2.md step 5), until the next RUN
+	 */
+	disable_irq(rtk->mbox->irq_recv_not_empty);
+	rtk->irq_off = true;
+	flush_workqueue(rtk->wq);
+
 	rtk->iop_power_state = APPLE_RTKIT_PWR_STATE_IDLE;
 	rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_IDLE;
 	return 0;
@@ -1164,56 +1384,63 @@ int apple_rtkit_wake(struct apple_rtkit *rtk)
 EXPORT_SYMBOL_GPL(apple_rtkit_wake);
 
 /*
- * macOS 27.0 RTBuddy::_performPowerStateChangeGated wake branch (K:b6ef268):
- * _setIopStatus(4) before AppleA7IOP::startCPUWithOptions, then _iopValidate
- * (K:b6efb78) waits for status 8, set by the IOP's power acknowledge
- * (_handlePowerAck, K:b7024d0); no IOP power state message is sent. The AP
- * state (0x20) follows from the route notification, as apple_rtkit_boot()
- * does.
+ * RTBuddy::_performPowerStateChangeGated wake branch (K:b6ef268):
+ * _setIopStatus(4), then AppleA7IOP::startCPUWithOptions (K:8c08c4c):
+ * outbox enable (ASC+0x8114 bit 0, the mailbox I2A control) and the mailbox
+ * interrupts on, then the caller sets RUN and calls apple_rtkit_boot(), whose
+ * _iopValidate (K:b6efb78) waits only for the IOP's own power acknowledge
+ * 0x20. A HELLO and roll call from the firmware are answered, the roll call
+ * as a later one (rollcall_done); no IOP power state message is sent.
  */
 void apple_rtkit_expect_iop_wake(struct apple_rtkit *rtk)
 {
 	reinit_completion(&rtk->iop_pwr_ack_completion);
+	apple_mbox_set_outbox(rtk->mbox, true);
+	if (rtk->irq_off) {
+		rtk->irq_off = false;
+		enable_irq(rtk->mbox->irq_recv_not_empty);
+	}
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_expect_iop_wake);
 
-/*
- * RTBuddy wake from S2R (startCPUWithOptions, K:8c08c4c): outbox enable
- * (ASC+0x8114 bit 0, the mailbox I2A control), then the caller sets RUN and
- * calls apple_rtkit_boot(). _iopValidate (K:b6efb78) waits only for the
- * IOP's own power acknowledge; HELLO and the roll call are answered if the
- * firmware sends them (warm_restart), not required.
- */
 void apple_rtkit_warm_restart(struct apple_rtkit *rtk)
 {
-	rtk->warm_restart = true;
-	reinit_completion(&rtk->iop_pwr_ack_completion);
-	apple_mbox_set_outbox(rtk->mbox, true);
+	apple_rtkit_expect_iop_wake(rtk);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_warm_restart);
 
 /*
- * AppleA7IOP::stopCPU's mailbox half on AppleASCWrapV6, after the IOP went
- * idle: _enableOutbox(false) (K:8c0596c), then _isIdle's ASC+0x8000 & 3,
- * retried at 1 ms up to ten times (K:8c05420..8c054b4, K:8c0909c..8c090e0).
+ * AppleA7IOP::stopCPU's mailbox half on AppleASCWrapV6 (K:8c08fb0), after
+ * the IOP went idle: _enableOutbox(false) (K:8c0596c), then _isIdle once and
+ * after each of up to ten 1 ms sleeps: with idle-ctrl-check ASC+0x40 & 1,
+ * then ASC+0x8000 & 3, in the same check (K:8c05420-8c054b4). Still busy is a
+ * panic (A7IOP+0x109, set by the constructor, K:8c07ca8; K:8c090e4-8c0911c).
  * The caller clears RUN and bit 5 afterwards.
  */
-int apple_rtkit_stop_outbox(struct apple_rtkit *rtk)
+void apple_rtkit_stop_outbox(struct apple_rtkit *rtk, void __iomem *idle_ctrl)
 {
+	u32 v = 0;
 	int i;
 
 	apple_mbox_set_outbox(rtk->mbox, false);
-	for (i = 0; i < 10; i++) {
+	for (i = 0; i <= 10; i++) {
+		if (i)
+			msleep(1);
+		if (idle_ctrl && !((v = readl(idle_ctrl)) & 1))
+			continue;
 		if (apple_mbox_idle(rtk->mbox))
-			return 0;
-		usleep_range(1000, 1500);
+			return;
 	}
-	return -ETIMEDOUT;
+	panic("%s failed to become idle (0x%08x) in %dms\n", dev_name(rtk->dev), v, 10);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_stop_outbox);
 
 void apple_rtkit_free(struct apple_rtkit *rtk)
 {
+	WRITE_ONCE(rtk->watchdog_armed, false);
+	cancel_delayed_work_sync(&rtk->ping_work);
+	if (rtk->irq_off)
+		enable_irq(rtk->mbox->irq_recv_not_empty);
 	apple_mbox_stop(rtk->mbox);
 	destroy_workqueue(rtk->wq);
 

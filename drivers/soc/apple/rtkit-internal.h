@@ -9,12 +9,14 @@
 
 #include <linux/bitfield.h>
 #include <linux/bitmap.h>
+#include <clocksource/arm_arch_timer.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/mailbox.h>
 #include <linux/soc/apple/rtkit.h>
@@ -43,8 +45,27 @@ struct apple_rtkit {
 	bool early_crashlog;
 	struct completion crashlog_completion;
 	bool crashed;
-	/* restarted from DRAM after S2R: answer the roll call, start nothing */
-	bool warm_restart;
+	/*
+	 * RTBuddyManagementEndpoint +0x121 (K:b70231c): set at the first roll
+	 * call's last part, cleared only by reinit. Every later roll call (a
+	 * firmware restarted from DRAM after S2R) is answered with the AP's
+	 * enabled endpoints and starts nothing.
+	 */
+	bool rollcall_done;
+	/* mailbox receive interrupt off after an IOP idle, until the next RUN */
+	bool irq_off;
+	/* messages handled, for the timeout re-check (checkForWork) */
+	unsigned long rx_handled;
+
+	/* RTBuddy ping watchdog (ADT watchdog-enable, DT apple,rtkit-watchdog) */
+	bool watchdog;
+	bool watchdog_armed;
+	struct delayed_work ping_work;
+	u32 ping_sent;
+	u32 ping_acked;
+	unsigned long ping_since;
+	unsigned int ping_send_fails;
+	struct completion ping_ack_completion;
 
 	DECLARE_BITMAP(endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
 	/* endpoints the AP started: macOS answers a later roll call with its enabled set */

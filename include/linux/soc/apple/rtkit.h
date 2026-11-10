@@ -171,10 +171,17 @@ void apple_rtkit_expect_iop_wake(struct apple_rtkit *rtk);
 void apple_rtkit_warm_restart(struct apple_rtkit *rtk);
 
 /*
- * S2R stopCPU after apple_rtkit_idle(): outbox disable, then wait for the
- * ASC idle bits. The caller clears RUN and bit 5.
+ * RTBuddy action 3 on S2R: the AP power state only (0x201 off, 0x20 on), with
+ * the ping watchdog quiesced and re-armed.
  */
-int apple_rtkit_stop_outbox(struct apple_rtkit *rtk);
+int apple_rtkit_set_ap_power(struct apple_rtkit *rtk, bool on);
+
+/*
+ * S2R stopCPU after apple_rtkit_idle(): outbox disable, then up to 11 checks
+ * of the ASC idle bits (idle_ctrl: ASC+0x40, for idle-ctrl-check nubs, or
+ * NULL); still busy panics. The caller clears RUN and bit 5.
+ */
+void apple_rtkit_stop_outbox(struct apple_rtkit *rtk, void __iomem *idle_ctrl);
 
 /*
  * Shutdown the co-processor
