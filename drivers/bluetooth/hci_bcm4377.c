@@ -16,7 +16,6 @@
 #include <linux/of.h>
 #include <linux/pci.h>
 #include <linux/printk.h>
-#include <linux/suspend.h>
 
 #include <linux/unaligned.h>
 
@@ -2435,44 +2434,10 @@ static int bcm4377_suspend(struct device *dev)
 	return 0;
 }
 
-struct bcm4377_reprobe {
-	struct work_struct work;
-	struct pci_dev *pdev;
-};
-
-static void bcm4377_reprobe_work(struct work_struct *work)
-{
-	struct bcm4377_reprobe *r = container_of(work, struct bcm4377_reprobe, work);
-	int ret;
-
-	ret = device_reprobe(&r->pdev->dev);
-	if (ret)
-		dev_err(&r->pdev->dev, "reprobe after S2R failed: %d\n", ret);
-	pci_dev_put(r->pdev);
-	kfree(r);
-}
-
 static int bcm4377_resume(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct bcm4377_data *bcm4377 = pci_get_drvdata(pdev);
-
-	/*
-	 * Apple T8132 S2R powers the PCIe endpoints off (the link retrains
-	 * from PERST#; brcmfmac on the same chip downloads its firmware again):
-	 * the chip lost its firmware and its rings, so bind it again, which
-	 * reloads them as at boot. The HCI device is registered anew.
-	 */
-	if (pm_suspend_target_state == PM_SUSPEND_MEM) {
-		struct bcm4377_reprobe *r = kzalloc(sizeof(*r), GFP_KERNEL);
-
-		if (!r)
-			return -ENOMEM;
-		INIT_WORK(&r->work, bcm4377_reprobe_work);
-		r->pdev = pci_dev_get(pdev);
-		schedule_work(&r->work);
-		return 0;
-	}
 
 	iowrite32(BCM4377_BAR0_SLEEP_CONTROL_UNQUIESCE,
 		  bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
