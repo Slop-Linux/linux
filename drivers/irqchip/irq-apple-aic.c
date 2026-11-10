@@ -183,6 +183,9 @@
 #define SYS_IMP_APL_IPI_SR_EL1		sys_reg(3, 5, 15, 1, 1)
 #define IPI_SR_PENDING			BIT(0)
 
+/* AIC3: the core's opt-out from the AIC's IRQ distribution, bits 1:0 */
+#define SYS_IMP_APL_SIQ_CFG_EL1		sys_reg(3, 4, 15, 10, 4)
+
 /* Guest timer FIQ enable register */
 #define SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2	sys_reg(3, 5, 15, 1, 3)
 #define VM_TMR_FIQ_ENABLE_V		BIT(0)
@@ -887,6 +890,16 @@ static int aic_init_cpu(unsigned int cpu)
 		sysreg_clear_set_s(SYS_IMP_APL_UPMCR0_EL1, UPMCR0_IMODE,
 				   FIELD_PREP(UPMCR0_IMODE, UPMCR0_IMODE_OFF));
 	}
+
+	/*
+	 * AIC3: SIQ_CFG_EL1[1:0] opts this core out of the AIC's distribution
+	 * (there is no per-IRQ CPU target). XNU writes 0 at kernel init and in
+	 * arm_init_cpu, on every CPU start, the S2R wake included (macOS 27.0
+	 * K:be14db0, K:be0544c); m1n1 parks secondaries at 3 and iBoot leaves 0
+	 * on the boot CPU only.
+	 */
+	if (aic_irqc->info.version == 3)
+		write_sysreg_s(0, SYS_IMP_APL_SIQ_CFG_EL1);
 
 	/* Commit all of the above */
 	isb();
