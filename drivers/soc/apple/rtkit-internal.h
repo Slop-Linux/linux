@@ -42,6 +42,9 @@ struct apple_rtkit {
 	bool early_crashlog;
 	struct completion crashlog_completion;
 	bool crashed;
+	/* restarted from DRAM after S2R: echo the endpoint map, start nothing */
+	bool warm_restart;
+	u32 warm_last_mask;
 
 	DECLARE_BITMAP(endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
 

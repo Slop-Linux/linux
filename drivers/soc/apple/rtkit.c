@@ -180,7 +180,7 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 		ep = 32 * base + i;
 		dev_dbg(rtk->dev, "RTKit: Discovered endpoint 0x%02x\n", ep);
 		set_bit(ep, rtk->endpoints);
-		if (rtk->early_crashlog && ep == APPLE_RTKIT_EP_CRASHLOG)
+		if (!rtk->warm_restart && rtk->early_crashlog && ep == APPLE_RTKIT_EP_CRASHLOG)
 			apple_rtkit_start_ep(rtk, ep);
 	}
 
@@ -190,10 +190,29 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 	else
 		reply |= APPLE_RTKIT_MGMT_EPMAP_REPLY_MORE;
 
+	/*
+	 * macOS's reply to a firmware restarted from DRAM echoes the map, with
+	 * bit 1 added to the first part (DCP 0x51d -> 0x51f), and starts no
+	 * endpoint (aurora-silicon rtkit.c 296-316, measured under macOS).
+	 */
+	if (rtk->warm_restart) {
+		if (msg & APPLE_RTKIT_MGMT_EPMAP_LAST)
+			reply |= bitmap & rtk->warm_last_mask;
+		else
+			reply |= bitmap | BIT_ULL(1);
+	}
+
 	apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_EPMAP_REPLY, reply);
 
 	if (!(msg & APPLE_RTKIT_MGMT_EPMAP_LAST))
 		return;
+
+	if (rtk->warm_restart) {
+		rtk->warm_restart = false;
+		rtk->boot_result = 0;
+		complete_all(&rtk->epmap_completion);
+		return;
+	}
 
 	for_each_set_bit(ep, rtk->endpoints, APPLE_RTKIT_APP_ENDPOINT_START) {
 		if (rtk->early_crashlog && ep == APPLE_RTKIT_EP_CRASHLOG)
@@ -1150,6 +1169,15 @@ void apple_rtkit_expect_iop_wake(struct apple_rtkit *rtk)
 	reinit_completion(&rtk->iop_pwr_ack_completion);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_expect_iop_wake);
+
+void apple_rtkit_warm_restart(struct apple_rtkit *rtk, u32 last_mask)
+{
+	rtk->warm_restart = true;
+	rtk->warm_last_mask = last_mask;
+	reinit_completion(&rtk->epmap_completion);
+	reinit_completion(&rtk->iop_pwr_ack_completion);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_warm_restart);
 
 void apple_rtkit_free(struct apple_rtkit *rtk)
 {

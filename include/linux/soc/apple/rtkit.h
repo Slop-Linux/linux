@@ -163,6 +163,13 @@ int apple_rtkit_wake(struct apple_rtkit *rtk);
 void apple_rtkit_expect_iop_wake(struct apple_rtkit *rtk);
 
 /*
+ * As apple_rtkit_expect_iop_wake(), for a firmware that restarts from DRAM
+ * with HELLO: the endpoint map is echoed and no endpoint is started again
+ * (the firmware keeps its buffers). last_mask filters the last part.
+ */
+void apple_rtkit_warm_restart(struct apple_rtkit *rtk, u32 last_mask);
+
+/*
  * Shutdown the co-processor
  */
 int apple_rtkit_shutdown(struct apple_rtkit *rtk);
